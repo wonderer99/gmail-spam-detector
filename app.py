@@ -28,15 +28,25 @@ def get_client_config():
         }
     }
 
+def make_flow(config):
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(config, f)
+        temp_path = f.name
+    flow = Flow.from_client_secrets_file(
+        temp_path,
+        scopes=SCOPES,
+        redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+    )
+    os.unlink(temp_path)
+    return flow
+
 def get_service():
-    # Already authorized in this session
     if "creds" in st.session_state:
         creds = st.session_state["creds"]
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
         return build('gmail', 'v1', credentials=creds)
 
-    # Token stored in secrets
     if "token" in st.secrets:
         token_data = dict(st.secrets["token"])
         creds = Credentials(
@@ -59,15 +69,15 @@ def get_service():
 st.title("📧 Gmail Spam Detector")
 st.write("Scan your Gmail inbox for spam using AI!")
 
-# Generate auth URL once and store it
+# Generate auth URL once and store in session
 if "auth_url" not in st.session_state:
     config = get_client_config()
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump(config, f)
-        temp_path = f.name
-    flow = Flow.from_client_secrets_file(temp_path, scopes=SCOPES, redirect_uri="urn:ietf:wg:oauth:2.0:oob")
-    os.unlink(temp_path)
-    auth_url, _ = flow.authorization_url(prompt='consent')
+    flow = make_flow(config)
+    auth_url, _ = flow.authorization_url(
+        prompt='consent',
+        access_type='offline',
+        include_granted_scopes='true'
+    )
     st.session_state["auth_url"] = auth_url
     st.session_state["client_config"] = config
 
@@ -84,16 +94,25 @@ if service is None:
         if code.strip():
             try:
                 config = st.session_state["client_config"]
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                    json.dump(config, f)
-                    temp_path = f.name
-                flow = Flow.from_client_secrets_file(temp_path, scopes=SCOPES, redirect_uri="urn:ietf:wg:oauth:2.0:oob")
-                os.unlink(temp_path)
-                flow.fetch_token(code=code.strip())
-                creds = flow.credentials
+                flow = make_flow(config)
+                # Disable PKCE code verifier
+                flow.oauth2session.code_challenge_method = None
+                token = flow.oauth2session.fetch_token(
+                    "https://oauth2.googleapis.com/token",
+                    code=code.strip(),
+                    client_secret=config["installed"]["client_secret"]
+                )
+                creds = Credentials(
+                    token=token["access_token"],
+                    refresh_token=token.get("refresh_token"),
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=config["installed"]["client_id"],
+                    client_secret=config["installed"]["client_secret"],
+                    scopes=SCOPES
+                )
                 st.session_state["creds"] = creds
                 st.success("✅ Authorized! You can now scan emails.")
-                st.info("Add these to Streamlit Secrets to skip this step next time:")
+                st.info("Add these to Streamlit Secrets to skip this next time:")
                 st.code(f"""[token]
 token = "{creds.token}"
 refresh_token = "{creds.refresh_token}"
