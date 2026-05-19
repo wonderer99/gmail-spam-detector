@@ -16,37 +16,47 @@ with open('spam_model.pkl', 'rb') as f:
 with open('tfidf_vectorizer.pkl', 'rb') as f:
     tfidf = pickle.load(f)
 
+def get_redirect_uri():
+    # Get the current app URL from Streamlit
+    # On Streamlit Cloud this will be the public URL
+    return st.secrets.get("redirect_uri", "http://localhost:8501")
+
 def get_client_config():
     client_config = dict(st.secrets["google_credentials"])
+    redirect_uri = get_redirect_uri()
     return {
-        "installed": {
+        "web": {
             "client_id": client_config["client_id"],
             "client_secret": client_config["client_secret"],
-            "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
+            "redirect_uris": [redirect_uri],
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token"
         }
     }
 
-def make_flow(config):
+def make_flow():
+    config = get_client_config()
+    redirect_uri = get_redirect_uri()
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
         json.dump(config, f)
         temp_path = f.name
     flow = Flow.from_client_secrets_file(
         temp_path,
         scopes=SCOPES,
-        redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+        redirect_uri=redirect_uri
     )
     os.unlink(temp_path)
     return flow
 
 def get_service():
+    # Already authorized in this session
     if "creds" in st.session_state:
         creds = st.session_state["creds"]
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
         return build('gmail', 'v1', credentials=creds)
 
+    # Token stored in secrets (permanent fix)
     if "token" in st.secrets:
         token_data = dict(st.secrets["token"])
         creds = Credentials(
@@ -69,62 +79,43 @@ def get_service():
 st.title("📧 Gmail Spam Detector")
 st.write("Scan your Gmail inbox for spam using AI!")
 
-# Generate auth URL once and store in session
-if "auth_url" not in st.session_state:
-    config = get_client_config()
-    flow = make_flow(config)
-    auth_url, _ = flow.authorization_url(
-        prompt='consent',
-        access_type='offline',
-        include_granted_scopes='true'
-    )
-    st.session_state["auth_url"] = auth_url
-    st.session_state["client_config"] = config
+# Check if we got a code back in the URL query params
+query_params = st.query_params
+auth_code = query_params.get("code", None)
 
 service = get_service()
 
-if service is None:
-    st.warning("#### Gmail Authorization Required")
-    st.write("**Step 1:** Click below to authorize Gmail access:")
-    st.markdown(f"[👉 Authorize Gmail Access]({st.session_state['auth_url']})")
-    st.write("**Step 2:** Paste the code Google gives you:")
-
-    code = st.text_input("Authorization code:", key="auth_code")
-    if st.button("✅ Submit Code"):
-        if code.strip():
-            try:
-                config = st.session_state["client_config"]
-                flow = make_flow(config)
-                # Disable PKCE code verifier
-                flow.oauth2session.code_challenge_method = None
-                token = flow.oauth2session.fetch_token(
-                    "https://oauth2.googleapis.com/token",
-                    code=code.strip(),
-                    client_secret=config["installed"]["client_secret"]
-                )
-                creds = Credentials(
-                    token=token["access_token"],
-                    refresh_token=token.get("refresh_token"),
-                    token_uri="https://oauth2.googleapis.com/token",
-                    client_id=config["installed"]["client_id"],
-                    client_secret=config["installed"]["client_secret"],
-                    scopes=SCOPES
-                )
-                st.session_state["creds"] = creds
-                st.success("✅ Authorized! You can now scan emails.")
-                st.info("Add these to Streamlit Secrets to skip this next time:")
-                st.code(f"""[token]
+if service is None and auth_code:
+    # Exchange code for token
+    try:
+        flow = make_flow()
+        flow.fetch_token(code=auth_code)
+        creds = flow.credentials
+        st.session_state["creds"] = creds
+        # Clear the code from URL
+        st.query_params.clear()
+        st.success("✅ Authorized successfully!")
+        st.info("To avoid re-authorizing next time, add these to Streamlit Secrets:")
+        st.code(f"""[token]
 token = "{creds.token}"
 refresh_token = "{creds.refresh_token}"
 token_uri = "{creds.token_uri}"
 client_id = "{creds.client_id}"
 client_secret = "{creds.client_secret}"
 """)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed: {e}")
-        else:
-            st.warning("Please paste the code first!")
+        service = build('gmail', 'v1', credentials=creds)
+        st.rerun()
+    except Exception as e:
+        st.error(f"Authorization failed: {e}")
+        st.stop()
+
+if service is None:
+    flow = make_flow()
+    auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+    st.warning("#### Gmail Authorization Required")
+    st.write("Click below to authorize access to your Gmail:")
+    st.markdown(f"### [👉 Click here to authorize Gmail Access]({auth_url})")
+    st.write("You will be redirected back automatically after authorizing.")
     st.stop()
 
 # Authorized — show scanner
