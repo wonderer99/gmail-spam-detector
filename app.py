@@ -10,8 +10,37 @@ from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
+def get_flow():
+    client_config = dict(st.secrets["google_credentials"])
+    client_config_dict = {
+        "installed": {
+            "client_id": client_config["client_id"],
+            "client_secret": client_config["client_secret"],
+            "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    }
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(client_config_dict, f)
+        temp_path = f.name
+
+    flow = Flow.from_client_secrets_file(
+        temp_path,
+        scopes=SCOPES,
+        redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+    )
+    os.unlink(temp_path)
+    return flow
+
 def authenticate():
-    creds = None
+    # Already have token in session
+    if "creds" in st.session_state:
+        creds = st.session_state["creds"]
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            st.session_state["creds"] = creds
+        return build('gmail', 'v1', credentials=creds)
 
     # Load token from Streamlit secrets if it exists
     if "token" in st.secrets:
@@ -24,58 +53,43 @@ def authenticate():
             client_secret=token_data.get("client_secret"),
             scopes=SCOPES
         )
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+        if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-        else:
-            # Write credentials.json from secrets to a temp file
-            client_config = dict(st.secrets["google_credentials"])
-            client_config_dict = {
-                "installed": {
-                    "client_id": client_config["client_id"],
-                    "client_secret": client_config["client_secret"],
-                    "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token"
-                }
-            }
+        st.session_state["creds"] = creds
+        return build('gmail', 'v1', credentials=creds)
 
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                json.dump(client_config_dict, f)
-                temp_path = f.name
+    # Need to authorize
+    flow = get_flow()
+    auth_url, _ = flow.authorization_url(prompt='consent')
 
-            flow = Flow.from_client_secrets_file(
-                temp_path,
-                scopes=SCOPES,
-                redirect_uri="urn:ietf:wg:oauth:2.0:oob"
-            )
-            os.unlink(temp_path)
+    st.warning("### Gmail Authorization Required")
+    st.write("**Step 1:** Click the link below to authorize:")
+    st.markdown(f"[👉 Authorize Gmail Access]({auth_url})")
+    st.write("**Step 2:** Paste the code you receive here and press Enter:")
 
-            auth_url, _ = flow.authorization_url(prompt='consent')
+    auth_code = st.text_input("Authorization code:", key="auth_code_input")
 
-            st.warning("### Gmail Authorization Required")
-            st.write("Click the link below to authorize access to your Gmail:")
-            st.markdown(f"[Authorize Gmail Access]({auth_url})")
-            auth_code = st.text_input("Paste the authorization code here:")
-
-            if not auth_code:
-                st.stop()
-
-            flow.fetch_token(code=auth_code)
-            creds = flow.credentials
-
-            st.info("✅ Authorized! Add these to your Streamlit secrets under [token]:")
-            st.code(f"""
-[token]
+    if st.button("Submit Code"):
+        if auth_code:
+            try:
+                flow.fetch_token(code=auth_code.strip())
+                creds = flow.credentials
+                st.session_state["creds"] = creds
+                st.success("✅ Authorized successfully!")
+                st.info("To avoid re-authorizing next time, add these to Streamlit Secrets:")
+                st.code(f"""[token]
 token = "{creds.token}"
 refresh_token = "{creds.refresh_token}"
 token_uri = "{creds.token_uri}"
 client_id = "{creds.client_id}"
 client_secret = "{creds.client_secret}"
 """)
-
-    return build('gmail', 'v1', credentials=creds)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Authorization failed: {e}")
+        else:
+            st.warning("Please paste the authorization code first!")
+    st.stop()
 
 
 # Load model
