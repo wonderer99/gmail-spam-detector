@@ -3,9 +3,9 @@ import pickle
 import json
 import tempfile
 import os
+import requests as http_requests
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -16,47 +16,39 @@ with open('spam_model.pkl', 'rb') as f:
 with open('tfidf_vectorizer.pkl', 'rb') as f:
     tfidf = pickle.load(f)
 
-def get_redirect_uri():
-    # Get the current app URL from Streamlit
-    # On Streamlit Cloud this will be the public URL
-    return st.secrets.get("redirect_uri", "http://localhost:8501")
+def get_config():
+    c = dict(st.secrets["google_credentials"])
+    return c["client_id"], c["client_secret"], st.secrets["redirect_uri"]
 
-def get_client_config():
-    client_config = dict(st.secrets["google_credentials"])
-    redirect_uri = get_redirect_uri()
-    return {
-        "web": {
-            "client_id": client_config["client_id"],
-            "client_secret": client_config["client_secret"],
-            "redirect_uris": [redirect_uri],
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token"
-        }
+def get_auth_url(client_id, redirect_uri):
+    import urllib.parse
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent"
     }
+    return "https://accounts.google.com/o/oauth2/auth?" + urllib.parse.urlencode(params)
 
-def make_flow():
-    config = get_client_config()
-    redirect_uri = get_redirect_uri()
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump(config, f)
-        temp_path = f.name
-    flow = Flow.from_client_secrets_file(
-        temp_path,
-        scopes=SCOPES,
-        redirect_uri=redirect_uri
-    )
-    os.unlink(temp_path)
-    return flow
+def exchange_code(code, client_id, client_secret, redirect_uri):
+    resp = http_requests.post("https://oauth2.googleapis.com/token", data={
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code"
+    })
+    return resp.json()
 
 def get_service():
-    # Already authorized in this session
     if "creds" in st.session_state:
         creds = st.session_state["creds"]
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
         return build('gmail', 'v1', credentials=creds)
 
-    # Token stored in secrets (permanent fix)
     if "token" in st.secrets:
         token_data = dict(st.secrets["token"])
         creds = Credentials(
@@ -79,39 +71,46 @@ def get_service():
 st.title("📧 Gmail Spam Detector")
 st.write("Scan your Gmail inbox for spam using AI!")
 
-# Check if we got a code back in the URL query params
+client_id, client_secret, redirect_uri = get_config()
+
+# Check for auth code in URL
 query_params = st.query_params
 auth_code = query_params.get("code", None)
 
 service = get_service()
 
 if service is None and auth_code:
-    # Exchange code for token
     try:
-        flow = make_flow()
-        flow.fetch_token(code=auth_code)
-        creds = flow.credentials
+        token = exchange_code(auth_code, client_id, client_secret, redirect_uri)
+        if "error" in token:
+            st.error(f"Authorization failed: {token}")
+            st.stop()
+        creds = Credentials(
+            token=token["access_token"],
+            refresh_token=token.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=SCOPES
+        )
         st.session_state["creds"] = creds
-        # Clear the code from URL
         st.query_params.clear()
         st.success("✅ Authorized successfully!")
-        st.info("To avoid re-authorizing next time, add these to Streamlit Secrets:")
+        st.info("Add these to Streamlit Secrets to skip this next time:")
         st.code(f"""[token]
 token = "{creds.token}"
 refresh_token = "{creds.refresh_token}"
-token_uri = "{creds.token_uri}"
+token_uri = "https://oauth2.googleapis.com/token"
 client_id = "{creds.client_id}"
 client_secret = "{creds.client_secret}"
 """)
-        service = build('gmail', 'v1', credentials=creds)
         st.rerun()
     except Exception as e:
         st.error(f"Authorization failed: {e}")
         st.stop()
 
 if service is None:
-    flow = make_flow()
-    auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+    auth_url = get_auth_url(client_id, redirect_uri)
     st.warning("#### Gmail Authorization Required")
     st.write("Click below to authorize access to your Gmail:")
     st.markdown(f"### [👉 Click here to authorize Gmail Access]({auth_url})")
