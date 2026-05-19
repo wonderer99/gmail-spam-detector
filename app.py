@@ -1,8 +1,8 @@
 import streamlit as st
 import pickle
-import os
 import json
 import tempfile
+import os
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -10,9 +10,15 @@ from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
-def get_flow():
+# Load model
+with open('spam_model.pkl', 'rb') as f:
+    model = pickle.load(f)
+with open('tfidf_vectorizer.pkl', 'rb') as f:
+    tfidf = pickle.load(f)
+
+def get_client_config():
     client_config = dict(st.secrets["google_credentials"])
-    client_config_dict = {
+    return {
         "installed": {
             "client_id": client_config["client_id"],
             "client_secret": client_config["client_secret"],
@@ -21,28 +27,16 @@ def get_flow():
             "token_uri": "https://oauth2.googleapis.com/token"
         }
     }
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump(client_config_dict, f)
-        temp_path = f.name
 
-    flow = Flow.from_client_secrets_file(
-        temp_path,
-        scopes=SCOPES,
-        redirect_uri="urn:ietf:wg:oauth:2.0:oob"
-    )
-    os.unlink(temp_path)
-    return flow
-
-def authenticate():
-    # Already have token in session
+def get_service():
+    # Already authorized in this session
     if "creds" in st.session_state:
         creds = st.session_state["creds"]
-        if creds and creds.expired and creds.refresh_token:
+        if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            st.session_state["creds"] = creds
         return build('gmail', 'v1', credentials=creds)
 
-    # Load token from Streamlit secrets if it exists
+    # Token stored in secrets
     if "token" in st.secrets:
         token_data = dict(st.secrets["token"])
         creds = Credentials(
@@ -58,25 +52,48 @@ def authenticate():
         st.session_state["creds"] = creds
         return build('gmail', 'v1', credentials=creds)
 
-    # Need to authorize
-    flow = get_flow()
+    return None
+
+
+# --- UI ---
+st.title("📧 Gmail Spam Detector")
+st.write("Scan your Gmail inbox for spam using AI!")
+
+# Generate auth URL once and store it
+if "auth_url" not in st.session_state:
+    config = get_client_config()
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(config, f)
+        temp_path = f.name
+    flow = Flow.from_client_secrets_file(temp_path, scopes=SCOPES, redirect_uri="urn:ietf:wg:oauth:2.0:oob")
+    os.unlink(temp_path)
     auth_url, _ = flow.authorization_url(prompt='consent')
+    st.session_state["auth_url"] = auth_url
+    st.session_state["client_config"] = config
 
-    st.warning("### Gmail Authorization Required")
-    st.write("**Step 1:** Click the link below to authorize:")
-    st.markdown(f"[👉 Authorize Gmail Access]({auth_url})")
-    st.write("**Step 2:** Paste the code you receive here and press Enter:")
+service = get_service()
 
-    auth_code = st.text_input("Authorization code:", key="auth_code_input")
+if service is None:
+    st.warning("#### Gmail Authorization Required")
+    st.write("**Step 1:** Click below to authorize Gmail access:")
+    st.markdown(f"[👉 Authorize Gmail Access]({st.session_state['auth_url']})")
+    st.write("**Step 2:** Paste the code Google gives you:")
 
-    if st.button("Submit Code"):
-        if auth_code:
+    code = st.text_input("Authorization code:", key="auth_code")
+    if st.button("✅ Submit Code"):
+        if code.strip():
             try:
-                flow.fetch_token(code=auth_code.strip())
+                config = st.session_state["client_config"]
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                    json.dump(config, f)
+                    temp_path = f.name
+                flow = Flow.from_client_secrets_file(temp_path, scopes=SCOPES, redirect_uri="urn:ietf:wg:oauth:2.0:oob")
+                os.unlink(temp_path)
+                flow.fetch_token(code=code.strip())
                 creds = flow.credentials
                 st.session_state["creds"] = creds
-                st.success("✅ Authorized successfully!")
-                st.info("To avoid re-authorizing next time, add these to Streamlit Secrets:")
+                st.success("✅ Authorized! You can now scan emails.")
+                st.info("Add these to Streamlit Secrets to skip this step next time:")
                 st.code(f"""[token]
 token = "{creds.token}"
 refresh_token = "{creds.refresh_token}"
@@ -86,28 +103,15 @@ client_secret = "{creds.client_secret}"
 """)
                 st.rerun()
             except Exception as e:
-                st.error(f"Authorization failed: {e}")
+                st.error(f"Failed: {e}")
         else:
-            st.warning("Please paste the authorization code first!")
+            st.warning("Please paste the code first!")
     st.stop()
 
-
-# Load model
-with open('spam_model.pkl', 'rb') as f:
-    model = pickle.load(f)
-with open('tfidf_vectorizer.pkl', 'rb') as f:
-    tfidf = pickle.load(f)
-
-# UI
-st.title("📧 Gmail Spam Detector")
-st.write("Scan your Gmail inbox for spam using AI!")
-
+# Authorized — show scanner
 num_emails = st.slider("How many emails to scan?", 10, 100, 20)
 
 if st.button("🔍 Scan My Emails"):
-    with st.spinner("Connecting to Gmail..."):
-        service = authenticate()
-
     with st.spinner("Scanning emails..."):
         results = service.users().messages().list(userId='me', maxResults=num_emails).execute()
         messages = results.get('messages', [])
